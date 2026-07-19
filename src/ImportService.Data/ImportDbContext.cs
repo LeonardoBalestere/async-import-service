@@ -35,6 +35,7 @@ public class ImportDbContext(DbContextOptions<ImportDbContext> options) : DbCont
         {
             outbox.Property(o => o.Type).HasMaxLength(100);
             outbox.Property(o => o.RoutingKey).HasMaxLength(100);
+            outbox.Property(o => o.TraceParent).HasMaxLength(64);
             // Índice parcial: o dispatcher só varre pendentes — a maioria da tabela é histórico.
             outbox.HasIndex(o => o.CreatedAt).HasFilter("\"DispatchedAt\" IS NULL");
         });

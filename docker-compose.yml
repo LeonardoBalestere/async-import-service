@@ -47,7 +47,17 @@ services:
     volumes:
       - minio-data:/data
 
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000" # Grafana UI (anônimo habilitado na imagem)
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - lgtm-data:/data
+
 volumes:
   rabbitmq-data:
   postgres-data:
   minio-data:
+  lgtm-data:

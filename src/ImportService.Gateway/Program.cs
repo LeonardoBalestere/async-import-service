@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Amazon.Runtime;
@@ -8,6 +9,10 @@ using ImportService.Data;
 using ImportService.Gateway;
 using ImportService.Messaging;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using RabbitMQ.Client;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +34,32 @@ builder.Services.AddSingleton<IConnection>(_ =>
         .CreateConnectionAsync().GetAwaiter().GetResult());
 
 builder.Services.AddHostedService<OutboxDispatcher>();
+
+var otlpEndpoint = new Uri(builder.Configuration["Otlp:Endpoint"] ?? "http://localhost:4317");
+
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService("import-gateway"))
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()          // cobre as chamadas S3 (o SDK usa HttpClient)
+        .AddSource("Npgsql")                     // spans de SQL nativos do driver
+        .AddSource("RabbitMQ.Client.Publisher")  // publish nativo do client 7 (injeta traceparent)
+        .AddSource(ImportTelemetry.SourceName)
+        .AddOtlpExporter(o => o.Endpoint = otlpEndpoint))
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddRuntimeInstrumentation()             // GC, heap, threads — a história da memória
+        .AddMeter("Npgsql")
+        .AddMeter(ImportTelemetry.SourceName)
+        .AddOtlpExporter(o => o.Endpoint = otlpEndpoint));
+
+builder.Logging.AddOpenTelemetry(logging =>
+{
+    logging.IncludeFormattedMessage = true;
+    logging.IncludeScopes = true;
+    logging.AddOtlpExporter(o => o.Endpoint = otlpEndpoint);
+});
 
 var app = builder.Build();
 
@@ -114,8 +145,7 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
         };
 
         // Outbox transacional: job e mensagem nascem na MESMA transação — ou os
-        // dois existem, ou nenhum. O dual-write com o broker deixa de ser possível;
-        // quem publica é o OutboxDispatcher, depois, com confirms.
+        // dois existem, ou nenhum. Quem publica é o OutboxDispatcher, depois.
         db.ImportJobs.Add(job);
         db.OutboxMessages.Add(new OutboxMessage
         {
@@ -124,6 +154,8 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
             RoutingKey = ImportsTopology.XlsxRoutingKey,
             Payload = JsonSerializer.Serialize(message),
             CreatedAt = DateTimeOffset.UtcNow,
+            // O trace do request atravessa a outbox: o dispatcher retoma este contexto.
+            TraceParent = Activity.Current?.Id,
         });
         await db.SaveChangesAsync(ct);
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Amazon.S3;
@@ -40,7 +41,7 @@ public class Worker(
             try
             {
                 message = JsonSerializer.Deserialize<FileImportRequested>(delivery.Body.Span);
-                await ProcessAsync(message!, stoppingToken);
+                await ProcessAsync(message!, ExtractTraceContext(delivery.BasicProperties), stoppingToken);
 
                 // Ack manual só depois de persistir: worker morto antes desta linha
                 // significa reentrega — e reentrega é segura (processamento idempotente).
@@ -84,79 +85,99 @@ public class Worker(
         await Task.Delay(Timeout.Infinite, stoppingToken);
     }
 
-    private async Task ProcessAsync(FileImportRequested message, CancellationToken ct)
+    private async Task ProcessAsync(FileImportRequested message, ActivityContext parentContext, CancellationToken ct)
     {
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<ImportDbContext>();
+        // Propagação manual: o pai vem do header W3C "traceparent" que o publish
+        // injetou na mensagem — o trace continua o do request original.
+        using var activity = ImportTelemetry.ActivitySource.StartActivity(
+            "import process", ActivityKind.Consumer, parentContext);
+        activity?.SetTag("import.job_id", message.JobId);
+        activity?.SetTag("import.file_size_bytes", message.FileSizeBytes);
+        var stopwatch = Stopwatch.StartNew();
 
-        var job = await db.ImportJobs.FindAsync([message.JobId], ct)
-            ?? throw new InvalidOperationException($"Job {message.JobId} não existe no banco");
-
-        if (job.Status == ImportJobStatus.Completed)
-        {
-            logger.LogInformation("Job {JobId} já concluído (reentrega); ignorando", job.Id);
-            return;
-        }
-
-        job.Status = ImportJobStatus.Processing;
-        job.UpdatedAt = DateTimeOffset.UtcNow;
-        await db.SaveChangesAsync(ct);
-
-        // Download para arquivo temporário: o leitor precisa de Seek (xlsx é um ZIP
-        // com o diretório central no FIM) e o peso do arquivo fica em disco, não na RAM.
-        var tempPath = Path.GetTempFileName();
         try
         {
-            using (var response = await s3.GetObjectAsync(message.Bucket, message.ObjectKey, ct))
-            await using (var temp = File.Create(tempPath))
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ImportDbContext>();
+
+            var job = await db.ImportJobs.FindAsync([message.JobId], ct)
+                ?? throw new InvalidOperationException($"Job {message.JobId} não existe no banco");
+
+            if (job.Status == ImportJobStatus.Completed)
             {
-                await response.ResponseStream.CopyToAsync(temp, ct);
+                logger.LogInformation("Job {JobId} já concluído (reentrega); ignorando", job.Id);
+                return;
             }
 
-            var total = 0;
-            await using (var fileStream = File.OpenRead(tempPath))
-            await using (var tx = await db.Database.BeginTransactionAsync(ct))
+            job.Status = ImportJobStatus.Processing;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            // Download para arquivo temporário: o leitor precisa de Seek (xlsx é um ZIP
+            // com o diretório central no FIM) e o peso do arquivo fica em disco, não na RAM.
+            var tempPath = Path.GetTempFileName();
+            try
             {
-                await db.ImportedTransactions.Where(t => t.JobId == job.Id).ExecuteDeleteAsync(ct);
-
-                // Inserts em lote com ChangeTracker.Clear(): a memória do EF fica
-                // limitada ao lote corrente, não ao arquivo inteiro.
-                var batch = new List<ImportedTransaction>(BatchSize);
-                foreach (var row in parser.Parse(fileStream))
+                using (var response = await s3.GetObjectAsync(message.Bucket, message.ObjectKey, ct))
+                await using (var temp = File.Create(tempPath))
                 {
-                    batch.Add(new ImportedTransaction
-                    {
-                        JobId = job.Id,
-                        RowNumber = row.RowNumber,
-                        Date = row.Date,
-                        Account = row.Account,
-                        Description = row.Description,
-                        Amount = row.Amount,
-                    });
-
-                    if (batch.Count == BatchSize)
-                    {
-                        total += await FlushAsync(db, batch, ct);
-                    }
+                    await response.ResponseStream.CopyToAsync(temp, ct);
                 }
 
-                total += await FlushAsync(db, batch, ct);
+                var total = 0;
+                await using (var fileStream = File.OpenRead(tempPath))
+                await using (var tx = await db.Database.BeginTransactionAsync(ct))
+                {
+                    await db.ImportedTransactions.Where(t => t.JobId == job.Id).ExecuteDeleteAsync(ct);
 
-                // ChangeTracker.Clear() desanexou o job — ExecuteUpdate escreve direto.
-                await db.ImportJobs.Where(j => j.Id == job.Id).ExecuteUpdateAsync(set => set
-                    .SetProperty(j => j.Status, ImportJobStatus.Completed)
-                    .SetProperty(j => j.TotalRows, total)
-                    .SetProperty(j => j.ErrorMessage, (string?)null)
-                    .SetProperty(j => j.UpdatedAt, DateTimeOffset.UtcNow), ct);
+                    // Inserts em lote com ChangeTracker.Clear(): a memória do EF fica
+                    // limitada ao lote corrente, não ao arquivo inteiro.
+                    var batch = new List<ImportedTransaction>(BatchSize);
+                    foreach (var row in parser.Parse(fileStream))
+                    {
+                        batch.Add(new ImportedTransaction
+                        {
+                            JobId = job.Id,
+                            RowNumber = row.RowNumber,
+                            Date = row.Date,
+                            Account = row.Account,
+                            Description = row.Description,
+                            Amount = row.Amount,
+                        });
 
-                await tx.CommitAsync(ct);
+                        if (batch.Count == BatchSize)
+                        {
+                            total += await FlushAsync(db, batch, ct);
+                        }
+                    }
+
+                    total += await FlushAsync(db, batch, ct);
+
+                    // ChangeTracker.Clear() desanexou o job — ExecuteUpdate escreve direto.
+                    await db.ImportJobs.Where(j => j.Id == job.Id).ExecuteUpdateAsync(set => set
+                        .SetProperty(j => j.Status, ImportJobStatus.Completed)
+                        .SetProperty(j => j.TotalRows, total)
+                        .SetProperty(j => j.ErrorMessage, (string?)null)
+                        .SetProperty(j => j.UpdatedAt, DateTimeOffset.UtcNow), ct);
+
+                    await tx.CommitAsync(ct);
+                }
+
+                activity?.SetTag("import.total_rows", total);
+                ImportTelemetry.RowsImported.Add(total);
+                ImportTelemetry.ImportDuration.Record(stopwatch.Elapsed.TotalSeconds);
+
+                logger.LogInformation("Job {JobId} concluído: {Rows} linhas importadas", job.Id, total);
             }
-
-            logger.LogInformation("Job {JobId} concluído: {Rows} linhas importadas", job.Id, total);
+            finally
+            {
+                File.Delete(tempPath);
+            }
         }
-        finally
+        catch (Exception ex)
         {
-            File.Delete(tempPath);
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            throw;
         }
     }
 
@@ -198,6 +219,19 @@ public class Worker(
         {
             logger.LogError(dbEx, "Não foi possível registrar a falha do job {JobId}", message.JobId);
         }
+    }
+
+    private static ActivityContext ExtractTraceContext(IReadOnlyBasicProperties properties)
+    {
+        if (properties.Headers is not null
+            && properties.Headers.TryGetValue("traceparent", out var raw)
+            && raw is byte[] bytes
+            && ActivityContext.TryParse(Encoding.UTF8.GetString(bytes), null, out var context))
+        {
+            return context;
+        }
+
+        return default;
     }
 
     private static long GetRejectionCount(IReadOnlyBasicProperties properties)

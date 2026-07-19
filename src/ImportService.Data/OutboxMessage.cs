@@ -14,6 +14,12 @@ public class OutboxMessage
     public required string Payload { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? DispatchedAt { get; set; }
+
+    /// <summary>
+    /// W3C traceparent capturado no request original. O dispatcher publica em outro
+    /// momento/thread — sem isso, o trace quebraria na fronteira da outbox.
+    /// </summary>
+    public string? TraceParent { get; set; }
     public int Attempts { get; set; }
     public string? LastError { get; set; }
 }

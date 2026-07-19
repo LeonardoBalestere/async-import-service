@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using ImportService.Data;
 using ImportService.Messaging;
@@ -83,6 +84,13 @@ public class OutboxDispatcher(
 
         foreach (var message in batch)
         {
+            // Retoma o trace do request original (persistido na outbox): o span de
+            // publish nasce como continuação dele, não como trace órfão do polling.
+            ActivityContext.TryParse(message.TraceParent, null, out var parentContext);
+            using var activity = ImportTelemetry.ActivitySource.StartActivity(
+                "outbox dispatch", ActivityKind.Producer, parentContext);
+            activity?.SetTag("messaging.message.id", message.Id.ToString());
+
             try
             {
                 // Com confirms ligado, este await só completa quando o broker confirma.
