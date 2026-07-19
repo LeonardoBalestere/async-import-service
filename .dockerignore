@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.git/
+.claude/
+k8s/
+samples/
+tests/
+tools/
+*.md
+docker-compose.yml

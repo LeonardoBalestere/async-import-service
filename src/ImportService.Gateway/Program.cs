@@ -30,8 +30,13 @@ builder.Services.AddSingleton<IAmazonS3>(_ => new AmazonS3Client(
     }));
 
 builder.Services.AddSingleton<IConnection>(_ =>
-    new ConnectionFactory { HostName = builder.Configuration["RabbitMq:Host"]! }
-        .CreateConnectionAsync().GetAwaiter().GetResult());
+    new ConnectionFactory
+    {
+        HostName = builder.Configuration["RabbitMq:Host"]!,
+        // guest/guest só aceita conexão de localhost; em cluster usamos outro usuário.
+        UserName = builder.Configuration["RabbitMq:User"] ?? "guest",
+        Password = builder.Configuration["RabbitMq:Password"] ?? "guest",
+    }.CreateConnectionAsync().GetAwaiter().GetResult());
 
 builder.Services.AddHostedService<OutboxDispatcher>();
 

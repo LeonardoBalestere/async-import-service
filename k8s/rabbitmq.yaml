@@ -1,0 +1,57 @@
+# Dev-grade: 1 réplica, dados em emptyDir (a fila é durável no disco do pod,
+# mas morre com ele). Em produção: RabbitMQ Cluster Operator + quorum queues.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: import-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4-management
+          env:
+            # guest/guest só aceita conexão de localhost — dentro do cluster
+            # todo acesso é remoto, então criamos um usuário próprio.
+            - name: RABBITMQ_DEFAULT_USER
+              value: import
+            - name: RABBITMQ_DEFAULT_PASS
+              value: import
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: import-service
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+    - name: management
+      port: 15672

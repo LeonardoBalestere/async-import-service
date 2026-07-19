@@ -1,0 +1,43 @@
+# O KEDA consulta o RabbitMQ diretamente (não depende da métrica do worker —
+# worker a zero não reporta métrica nenhuma) e ajusta as réplicas do Deployment.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-conn
+  namespace: import-service
+type: Opaque
+stringData:
+  host: amqp://import:import@rabbitmq.import-service.svc.cluster.local:5672/
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: rabbitmq-auth
+  namespace: import-service
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: rabbitmq-conn
+      key: host
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: import-worker
+  namespace: import-service
+spec:
+  scaleTargetRef:
+    name: import-worker
+  minReplicaCount: 0 # fila vazia = zero workers = zero custo
+  maxReplicaCount: 4
+  pollingInterval: 5 # segundos entre consultas à fila
+  cooldownPeriod: 60 # espera antes de voltar a 0
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        queueName: file-imports
+        mode: QueueLength
+        value: "1" # alvo: 1 mensagem por réplica → réplicas = ceil(profundidade/1)
+      authenticationRef:
+        name: rabbitmq-auth

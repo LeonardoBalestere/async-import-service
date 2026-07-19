@@ -5,6 +5,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>dotnet-ImportService.Worker-6cdbda3b-8323-4528-8fae-4cc555e58efe</UserSecretsId>
+    <!-- Roda em imagem chiseled sem depender de ICU; toda cultura no código é explícita -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>

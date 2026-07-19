@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: import-gateway
+  namespace: import-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: import-gateway
+  template:
+    metadata:
+      labels:
+        app: import-gateway
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull # criado imperativamente; não versionado
+      containers:
+        - name: gateway
+          image: ghcr.io/leonardobalestere/import-gateway:0.4.0
+          ports:
+            - containerPort: 8080
+          env:
+            # Config por env var (___ vira : na hierarquia do .NET).
+            # Dev-grade: credenciais em claro; produção usaria Secret + ExternalSecrets.
+            - name: ConnectionStrings__Postgres
+              value: Host=postgres;Port=5432;Database=importdb;Username=import;Password=import
+            - name: RabbitMq__Host
+              value: rabbitmq
+            - name: RabbitMq__User
+              value: import
+            - name: RabbitMq__Password
+              value: import
+            - name: RabbitMq__RetryDelayMs
+              value: "5000"
+            - name: S3__ServiceUrl
+              value: http://minio:9000
+            - name: S3__AccessKey
+              value: minioadmin
+            - name: S3__SecretKey
+              value: minioadmin
+            - name: S3__Bucket
+              value: imports
+            # Observabilidade fica fora do cluster (papel de "vendor gerenciado").
+            - name: Otlp__Endpoint
+              value: http://host.docker.internal:4317
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: import-gateway
+  namespace: import-service
+spec:
+  selector:
+    app: import-gateway
+  ports:
+    - port: 8080

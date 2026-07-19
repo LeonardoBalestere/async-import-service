@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: import-worker
+  namespace: import-service
+spec:
+  replicas: 1 # o KEDA assume o controle (0..4) via ScaledObject
+  selector:
+    matchLabels:
+      app: import-worker
+  template:
+    metadata:
+      labels:
+        app: import-worker
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: worker
+          image: ghcr.io/leonardobalestere/import-worker:0.4.0
+          env:
+            - name: ConnectionStrings__Postgres
+              value: Host=postgres;Port=5432;Database=importdb;Username=import;Password=import
+            - name: RabbitMq__Host
+              value: rabbitmq
+            - name: RabbitMq__User
+              value: import
+            - name: RabbitMq__Password
+              value: import
+            - name: RabbitMq__RetryDelayMs
+              value: "5000"
+            - name: RabbitMq__MaxAttempts
+              value: "3"
+            - name: S3__ServiceUrl
+              value: http://minio:9000
+            - name: S3__AccessKey
+              value: minioadmin
+            - name: S3__SecretKey
+              value: minioadmin
+            - name: S3__Bucket
+              value: imports
+            - name: Otlp__Endpoint
+              value: http://host.docker.internal:4317
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            # 512Mi só é viável por causa do streaming-parse da Fase 2:
+            # o parser ingênuo picava em 1.148 MB e seria OOMKilled aqui.
+            limits:
+              memory: 512Mi

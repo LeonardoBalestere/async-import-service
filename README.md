@@ -60,6 +60,32 @@ Duas fronteiras que normalmente quebram o trace são costuradas explicitamente: 
 
 Métricas: `rabbitmq.queue.depth` por fila (o sinal que o KEDA usará na Fase 4), `import.rows`, `import.duration`, e métricas de runtime (GC/heap — a história da Fase 2 virou dashboard). Logs dos dois serviços vão ao Loki via OTLP. Tudo em http://localhost:3000 (Grafana, anônimo).
 
+### Kubernetes + KEDA
+
+Imagens **multi-stage** (SDK → `noble-chiseled`: sem shell, non-root, ~170-195 MB) publicadas no GHCR; manifests em [k8s/](k8s/) com RabbitMQ, Postgres (PVC), MinIO (PVC), Gateway, Worker e o ScaledObject do KEDA. O limite de memória do worker (512Mi) **só é viável por causa do streaming da Fase 2** — o parser ingênuo de 1.148 MB seria OOMKilled.
+
+```bash
+kind create cluster --name import
+kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.20.1/keda-2.20.1.yaml
+kubectl apply -f k8s/namespace.yaml
+kubectl create secret docker-registry ghcr-pull -n import-service \
+  --docker-server=ghcr.io --docker-username=<user> --docker-password=<token com read:packages>
+kubectl apply -f k8s/
+kubectl port-forward svc/import-gateway 5080:8080 -n import-service
+```
+
+Demo medida do autoscaling (3 uploads de ~300k linhas com a fila vazia e **zero workers**):
+
+| t | evento |
+|---|---|
+| 0s | 3 uploads; fila com 3 mensagens; 0 workers |
+| 8s | KEDA acorda o 1º worker |
+| 11,5s | 2º worker (o KEDA conta mensagens *ready* — a que o 1º worker já puxou, não-ackada, sai da conta) |
+| ~50s | 840 mil linhas persistidas, fila vazia |
+| 111s | cooldown de 60s vencido → **0 workers** |
+
+Dev-grade declarado: infra stateful em Deployment simples com credenciais em env var. Em produção: RabbitMQ Cluster Operator, CloudNativePG (ou banco gerenciado), Secrets externos, e o Grafana/LGTM — que aqui ficou fora do cluster de propósito, no papel de observabilidade gerenciada.
+
 ## Stack
 
 | Peça | Papel | Por quê |
@@ -80,7 +106,7 @@ Métricas: `rabbitmq.queue.depth` por fila (o sinal que o KEDA usará na Fase 4)
 - [x] **1 — MVP ponta a ponta**: upload → storage → publish → consume → parse → Postgres, com idempotência, ack manual e entidade de job mínima
 - [x] **2 — Endurecimento**: streaming-parse (medido: 1.148 → 203 MB), retry com TTL + DLQ, roteamento por tipo via exchange, outbox transacional com publisher confirms
 - [x] **3 — Observabilidade**: OTel com trace atravessando outbox e broker (17 spans num upload), métricas de fila/negócio/runtime e logs no Grafana LGTM
-- [ ] **4 — Docker multi-stage, Kubernetes, KEDA**
+- [x] **4 — Docker multi-stage, Kubernetes, KEDA**: imagens chiseled no GHCR, manifests completos (infra + app), worker escalando 0→N→0 por profundidade de fila
 - [ ] **5 — DynamoDB via LocalStack** (status de job com TTL)
 - [ ] **6 — Polimento**: README completo com justificativas, CI no GitHub Actions
 
