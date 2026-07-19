@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\ImportService.Contracts\ImportService.Contracts.csproj" />
     <ProjectReference Include="..\ImportService.Data\ImportService.Data.csproj" />
+    <ProjectReference Include="..\ImportService.Messaging\ImportService.Messaging.csproj" />
   </ItemGroup>
 
   <ItemGroup>

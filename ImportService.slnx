@@ -3,6 +3,7 @@
     <Project Path="src/ImportService.Contracts/ImportService.Contracts.csproj" />
     <Project Path="src/ImportService.Data/ImportService.Data.csproj" />
     <Project Path="src/ImportService.Gateway/ImportService.Gateway.csproj" />
+    <Project Path="src/ImportService.Messaging/ImportService.Messaging.csproj" />
     <Project Path="src/ImportService.Worker/ImportService.Worker.csproj" />
   </Folder>
   <Folder Name="/tests/">

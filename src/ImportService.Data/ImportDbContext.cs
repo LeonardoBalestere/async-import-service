@@ -6,6 +6,7 @@ public class ImportDbContext(DbContextOptions<ImportDbContext> options) : DbCont
 {
     public DbSet<ImportJob> ImportJobs => Set<ImportJob>();
     public DbSet<ImportedTransaction> ImportedTransactions => Set<ImportedTransaction>();
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -28,6 +29,14 @@ public class ImportDbContext(DbContextOptions<ImportDbContext> options) : DbCont
             tx.Property(t => t.Description).HasMaxLength(500);
             tx.Property(t => t.Amount).HasPrecision(18, 2);
             tx.HasOne<ImportJob>().WithMany().HasForeignKey(t => t.JobId);
+        });
+
+        modelBuilder.Entity<OutboxMessage>(outbox =>
+        {
+            outbox.Property(o => o.Type).HasMaxLength(100);
+            outbox.Property(o => o.RoutingKey).HasMaxLength(100);
+            // Índice parcial: o dispatcher só varre pendentes — a maioria da tabela é histórico.
+            outbox.HasIndex(o => o.CreatedAt).HasFilter("\"DispatchedAt\" IS NULL");
         });
     }
 }

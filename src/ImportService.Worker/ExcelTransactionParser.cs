@@ -2,16 +2,14 @@ using ClosedXML.Excel;
 
 namespace ImportService.Worker;
 
-public sealed record ParsedTransaction(int RowNumber, DateOnly Date, string Account, string Description, decimal Amount);
-
 /// <summary>
-/// Lê a planilha no layout: Data | Conta | Descricao | Valor, cabeçalho na linha 1.
-/// ClosedXML carrega o workbook INTEIRO em memória — é a implementação ingênua
-/// proposital da Fase 1; a Fase 2 troca por leitura em streaming.
+/// Implementação ingênua mantida da Fase 1 para comparação: ClosedXML carrega o
+/// workbook INTEIRO em memória (medido: ~1,1 GB de pico para 300 mil linhas).
+/// Em produção o worker usa <see cref="StreamingExcelTransactionParser"/>.
 /// </summary>
-public sealed class ExcelTransactionParser
+public sealed class ExcelTransactionParser : ITransactionParser
 {
-    public IReadOnlyList<ParsedTransaction> Parse(Stream stream)
+    public IEnumerable<ParsedTransaction> Parse(Stream stream)
     {
         using var workbook = new XLWorkbook(stream);
         var sheet = workbook.Worksheet(1);

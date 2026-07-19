@@ -5,6 +5,8 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using ImportService.Contracts;
 using ImportService.Data;
+using ImportService.Gateway;
+using ImportService.Messaging;
 using Microsoft.EntityFrameworkCore;
 using RabbitMQ.Client;
 
@@ -26,10 +28,11 @@ builder.Services.AddSingleton<IConnection>(_ =>
     new ConnectionFactory { HostName = builder.Configuration["RabbitMq:Host"]! }
         .CreateConnectionAsync().GetAwaiter().GetResult());
 
+builder.Services.AddHostedService<OutboxDispatcher>();
+
 var app = builder.Build();
 
 var bucket = app.Configuration["S3:Bucket"]!;
-var queue = app.Configuration["RabbitMq:Queue"]!;
 
 // Infra pronta antes de aceitar tráfego — as três operações são idempotentes.
 using (var scope = app.Services.CreateScope())
@@ -47,10 +50,10 @@ using (var scope = app.Services.CreateScope())
 
     var mq = scope.ServiceProvider.GetRequiredService<IConnection>();
     await using var channel = await mq.CreateChannelAsync();
-    await channel.QueueDeclareAsync(queue, durable: true, exclusive: false, autoDelete: false);
+    await ImportsTopology.DeclareAsync(channel, app.Configuration.GetValue("RabbitMq:RetryDelayMs", 10000));
 }
 
-app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3, IConnection mq, CancellationToken ct) =>
+app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3, CancellationToken ct) =>
 {
     // O upload passa por um arquivo temporário em disco — nunca inteiro pela memória.
     var tempPath = Path.GetTempFileName();
@@ -98,9 +101,6 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
             }, ct);
         }
 
-        db.ImportJobs.Add(job);
-        await db.SaveChangesAsync(ct);
-
         var message = new FileImportRequested
         {
             JobId = job.Id,
@@ -113,17 +113,19 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
             UploadedAt = job.CreatedAt,
         };
 
-        await using (var channel = await mq.CreateChannelAsync(cancellationToken: ct))
+        // Outbox transacional: job e mensagem nascem na MESMA transação — ou os
+        // dois existem, ou nenhum. O dual-write com o broker deixa de ser possível;
+        // quem publica é o OutboxDispatcher, depois, com confirms.
+        db.ImportJobs.Add(job);
+        db.OutboxMessages.Add(new OutboxMessage
         {
-            await channel.BasicPublishAsync(
-                // Exchange default: a routing key é o próprio nome da fila.
-                exchange: string.Empty,
-                routingKey: queue,
-                mandatory: false,
-                basicProperties: new BasicProperties { Persistent = true, ContentType = "application/json" },
-                body: JsonSerializer.SerializeToUtf8Bytes(message),
-                cancellationToken: ct);
-        }
+            Id = Guid.CreateVersion7(),
+            Type = nameof(FileImportRequested),
+            RoutingKey = ImportsTopology.XlsxRoutingKey,
+            Payload = JsonSerializer.Serialize(message),
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync(ct);
 
         return Results.Accepted($"/imports/{job.Id}", new { jobId = job.Id, status = job.Status.ToString(), duplicate = false });
     }
@@ -145,5 +147,22 @@ app.MapGet("/imports/{id:guid}", async (Guid id, ImportDbContext db, Cancellatio
             error = job.ErrorMessage,
         })
         : Results.NotFound());
+
+app.MapGet("/imports", async (ImportDbContext db, CancellationToken ct, int limit = 20) =>
+{
+    var jobs = await db.ImportJobs.AsNoTracking()
+        .OrderByDescending(j => j.Id)
+        .Take(Math.Clamp(limit, 1, 100))
+        .ToListAsync(ct);
+
+    return Results.Ok(jobs.Select(j => new
+    {
+        jobId = j.Id,
+        fileName = j.FileName,
+        status = j.Status.ToString(),
+        totalRows = j.TotalRows,
+        error = j.ErrorMessage,
+    }));
+});
 
 app.Run();

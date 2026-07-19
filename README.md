@@ -8,13 +8,37 @@ Importação assíncrona de arquivos de grande volume. Inspirado num sistema rea
 flowchart LR
     U[Usuário] -->|upload| G[Gateway<br/>minimal API]
     G -->|grava o arquivo| S[(MinIO<br/>object storage)]
-    G -->|"FileImportRequested<br/>(referência, não conteúdo)"| Q[[RabbitMQ]]
+    G -->|"job + mensagem na<br/>MESMA transação (outbox)"| P[(PostgreSQL)]
+    OD[Outbox<br/>Dispatcher] -->|"varre pendentes<br/>(SKIP LOCKED)"| P
+    OD -->|"publish + confirms<br/>(referência, não conteúdo)"| Q[[RabbitMQ]]
     Q -->|competing consumers| W[Worker]
-    W -->|download em streaming| S
-    W -->|persistência idempotente| P[(PostgreSQL)]
+    W -->|download p/ temp file| S
+    W -->|lotes idempotentes| P
 ```
 
-O arquivo vai para o object storage; a mensagem carrega **só a referência** (padrão *Claim Check*). O broker distribui trabalho entre workers concorrentes (*work queue*), com ack manual e DLQ.
+O arquivo vai para o object storage; a mensagem carrega **só a referência** (padrão *Claim Check*) e nasce na **mesma transação** que o job (*transactional outbox* — o Gateway aceita uploads mesmo com o broker fora do ar). O broker distribui trabalho entre workers concorrentes (*work queue*), com ack manual, retry com espera e DLQ.
+
+### O conserto, medido
+
+O mesmo arquivo de **300 mil linhas**, na mesma máquina:
+
+| Métrica do worker | Fase 1 (ClosedXML, tudo em memória) | Fase 2 (ExcelDataReader, streaming + lotes) |
+|---|---|---|
+| Pico de memória | **1.148 MB** | **203 MB** (5,7× menor) |
+| Duração | 54 s | 47 s |
+| Em repouso | 49 MB | 47 MB |
+
+### Fluxo de falha (retry + DLQ)
+
+```
+file-imports ──nack──► imports.retry ──► file-imports.retry (TTL 5s)
+                                              │ expira
+file-imports ◄────────────────────────────────┘
+   │ após 3 tentativas (contadas pelo broker via x-death)
+   └──► file-imports.dlq (parking lot) + job marcado como Failed
+```
+
+A falha transitória se resolve sozinha; a permanente estaciona na DLQ com o payload intacto para diagnóstico, e o ledger (`ImportJobs`) guarda o motivo.
 
 ## Stack
 
@@ -33,7 +57,7 @@ O arquivo vai para o object storage; a mensagem carrega **só a referência** (p
 
 - [x] **0 — Fundação**: solution, docker-compose (RabbitMQ + Postgres + MinIO), contrato da mensagem
 - [x] **1 — MVP ponta a ponta**: upload → storage → publish → consume → parse → Postgres, com idempotência, ack manual e entidade de job mínima
-- [ ] **2 — Endurecimento**: streaming-parse (com medição de memória antes/depois), DLQ com retry, roteamento por tipo, endpoint de status, publisher confirms
+- [x] **2 — Endurecimento**: streaming-parse (medido: 1.148 → 203 MB), retry com TTL + DLQ, roteamento por tipo via exchange, outbox transacional com publisher confirms
 - [ ] **3 — Observabilidade**: OTel com propagação de contexto através do broker, métricas de fila/lag/memória
 - [ ] **4 — Docker multi-stage, Kubernetes, KEDA**
 - [ ] **5 — DynamoDB via LocalStack** (status de job com TTL)

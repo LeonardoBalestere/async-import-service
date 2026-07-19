@@ -4,6 +4,7 @@ public enum ImportJobStatus
 {
     Received,
     Processing,
+    Retrying,
     Completed,
     Failed,
 }

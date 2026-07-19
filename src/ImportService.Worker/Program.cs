@@ -22,7 +22,7 @@ builder.Services.AddSingleton<IConnection>(_ =>
     new ConnectionFactory { HostName = builder.Configuration["RabbitMq:Host"]! }
         .CreateConnectionAsync().GetAwaiter().GetResult());
 
-builder.Services.AddSingleton<ExcelTransactionParser>();
+builder.Services.AddSingleton<ITransactionParser, StreamingExcelTransactionParser>();
 builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();

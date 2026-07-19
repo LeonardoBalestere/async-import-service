@@ -3,8 +3,25 @@ using ImportService.Worker;
 
 namespace ImportService.Tests;
 
-public class ExcelTransactionParserTests
+/// <summary>
+/// Os dois parsers (ingênuo e streaming) devem ser comportamentalmente idênticos —
+/// a diferença entre eles é só o perfil de memória.
+/// </summary>
+public class TransactionParserTests
 {
+    public static TheoryData<string> Parsers => new()
+    {
+        nameof(ExcelTransactionParser),
+        nameof(StreamingExcelTransactionParser),
+    };
+
+    private static ITransactionParser CreateParser(string name) => name switch
+    {
+        nameof(ExcelTransactionParser) => new ExcelTransactionParser(),
+        nameof(StreamingExcelTransactionParser) => new StreamingExcelTransactionParser(),
+        _ => throw new ArgumentOutOfRangeException(nameof(name)),
+    };
+
     private static MemoryStream BuildWorkbook(params (DateTime Date, string Account, string Description, decimal Amount)[] rows)
     {
         var stream = new MemoryStream();
@@ -31,24 +48,26 @@ public class ExcelTransactionParserTests
         return stream;
     }
 
-    [Fact]
-    public void Parse_le_todas_as_linhas_de_dados_pulando_o_cabecalho()
+    [Theory]
+    [MemberData(nameof(Parsers))]
+    public void Parse_le_todas_as_linhas_de_dados_pulando_o_cabecalho(string parserName)
     {
         using var stream = BuildWorkbook(
             (new DateTime(2026, 1, 10), "ACC-0001", "Pagamento fornecedor", -1500.50m),
             (new DateTime(2026, 1, 11), "ACC-0002", "Recebimento cliente", 3200.00m));
 
-        var rows = new ExcelTransactionParser().Parse(stream);
+        var rows = CreateParser(parserName).Parse(stream).ToList();
 
         Assert.Equal(2, rows.Count);
     }
 
-    [Fact]
-    public void Parse_preserva_os_valores_tipados_de_cada_coluna()
+    [Theory]
+    [MemberData(nameof(Parsers))]
+    public void Parse_preserva_os_valores_tipados_de_cada_coluna(string parserName)
     {
         using var stream = BuildWorkbook((new DateTime(2026, 3, 5), "ACC-0042", "Tarifa bancária", -12.34m));
 
-        var row = Assert.Single(new ExcelTransactionParser().Parse(stream));
+        var row = Assert.Single(CreateParser(parserName).Parse(stream).ToList());
 
         Assert.Equal(new DateOnly(2026, 3, 5), row.Date);
         Assert.Equal("ACC-0042", row.Account);
@@ -57,11 +76,12 @@ public class ExcelTransactionParserTests
         Assert.Equal(2, row.RowNumber);
     }
 
-    [Fact]
-    public void Parse_planilha_so_com_cabecalho_retorna_vazio()
+    [Theory]
+    [MemberData(nameof(Parsers))]
+    public void Parse_planilha_so_com_cabecalho_retorna_vazio(string parserName)
     {
         using var stream = BuildWorkbook();
 
-        Assert.Empty(new ExcelTransactionParser().Parse(stream));
+        Assert.Empty(CreateParser(parserName).Parse(stream).ToList());
     }
 }

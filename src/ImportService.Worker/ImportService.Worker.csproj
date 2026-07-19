@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="4.0.101.3" />
     <PackageReference Include="ClosedXML" Version="0.105.0" />
+    <PackageReference Include="ExcelDataReader" Version="3.9.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
     <PackageReference Include="RabbitMQ.Client" Version="7.2.1" />
   </ItemGroup>
@@ -17,5 +18,6 @@
   <ItemGroup>
     <ProjectReference Include="..\ImportService.Contracts\ImportService.Contracts.csproj" />
     <ProjectReference Include="..\ImportService.Data\ImportService.Data.csproj" />
+    <ProjectReference Include="..\ImportService.Messaging\ImportService.Messaging.csproj" />
   </ItemGroup>
 </Project>

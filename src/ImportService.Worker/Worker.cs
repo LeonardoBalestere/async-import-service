@@ -1,7 +1,9 @@
+using System.Text;
 using System.Text.Json;
 using Amazon.S3;
 using ImportService.Contracts;
 using ImportService.Data;
+using ImportService.Messaging;
 using Microsoft.EntityFrameworkCore;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -11,37 +13,72 @@ namespace ImportService.Worker;
 public class Worker(
     IConnection connection,
     IAmazonS3 s3,
-    ExcelTransactionParser parser,
+    ITransactionParser parser,
     IServiceScopeFactory scopeFactory,
     IConfiguration configuration,
     ILogger<Worker> logger) : BackgroundService
 {
+    private const int BatchSize = 5000;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var queue = configuration["RabbitMq:Queue"]!;
+        var maxAttempts = configuration.GetValue("RabbitMq:MaxAttempts", 3);
 
         var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
-        await channel.QueueDeclareAsync(queue, durable: true, exclusive: false, autoDelete: false,
-            cancellationToken: stoppingToken);
+        await ImportsTopology.DeclareAsync(channel,
+            configuration.GetValue("RabbitMq:RetryDelayMs", 10000), stoppingToken);
 
-        // Uma mensagem não-ackada por vez: um arquivo grande já é trabalho suficiente,
-        // e mensagens não pré-buscadas ficam livres para outros workers concorrentes.
+        // Uma mensagem não-ackada por vez: um arquivo grande já é trabalho
+        // suficiente, e as demais ficam livres para workers concorrentes.
         await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
             cancellationToken: stoppingToken);
 
         var consumer = new AsyncEventingBasicConsumer(channel);
         consumer.ReceivedAsync += async (_, delivery) =>
         {
-            var message = JsonSerializer.Deserialize<FileImportRequested>(delivery.Body.Span)!;
-            await ProcessAsync(message, stoppingToken);
+            FileImportRequested? message = null;
+            try
+            {
+                message = JsonSerializer.Deserialize<FileImportRequested>(delivery.Body.Span);
+                await ProcessAsync(message!, stoppingToken);
 
-            // Ack manual só depois de persistir o resultado: se o worker morrer antes
-            // desta linha, o broker reentrega a mensagem a outro worker.
-            await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false,
-                cancellationToken: stoppingToken);
+                // Ack manual só depois de persistir: worker morto antes desta linha
+                // significa reentrega — e reentrega é segura (processamento idempotente).
+                await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false,
+                    cancellationToken: stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                // É o broker quem carrega o número da tentativa: x-death conta as
+                // rejeições desta mensagem na fila principal.
+                var attempt = GetRejectionCount(delivery.BasicProperties) + 1;
+                var exhausted = message is null || attempt >= maxAttempts;
+
+                await RecordFailureAsync(message, ex, exhausted, attempt, stoppingToken);
+
+                if (exhausted)
+                {
+                    // Parking-lot: cópia explícita para a DLQ e ack do original.
+                    await channel.BasicPublishAsync(ImportsTopology.DlqExchange, delivery.RoutingKey,
+                        mandatory: false, basicProperties: new BasicProperties(delivery.BasicProperties),
+                        body: delivery.Body, cancellationToken: stoppingToken);
+                    await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false,
+                        cancellationToken: stoppingToken);
+                    logger.LogError(ex, "Job {JobId} enviado à DLQ após {Attempt} tentativa(s)",
+                        message?.JobId, attempt);
+                }
+                else
+                {
+                    // Nack sem requeue → DLX → fila de retry → TTL → volta pra principal.
+                    await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: false,
+                        cancellationToken: stoppingToken);
+                    logger.LogWarning(ex, "Tentativa {Attempt} do job {JobId} falhou; retry agendado",
+                        attempt, message?.JobId);
+                }
+            }
         };
 
-        await channel.BasicConsumeAsync(queue, autoAck: false, consumer,
+        await channel.BasicConsumeAsync(ImportsTopology.FileImportsQueue, autoAck: false, consumer,
             cancellationToken: stoppingToken);
 
         await Task.Delay(Timeout.Infinite, stoppingToken);
@@ -52,16 +89,12 @@ public class Worker(
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ImportDbContext>();
 
-        var job = await db.ImportJobs.FindAsync([message.JobId], ct);
-        if (job is null)
-        {
-            logger.LogWarning("Job {JobId} não existe no banco; descartando mensagem", message.JobId);
-            return;
-        }
+        var job = await db.ImportJobs.FindAsync([message.JobId], ct)
+            ?? throw new InvalidOperationException($"Job {message.JobId} não existe no banco");
 
         if (job.Status == ImportJobStatus.Completed)
         {
-            logger.LogInformation("Job {JobId} já concluído (mensagem reentregue); ignorando", message.JobId);
+            logger.LogInformation("Job {JobId} já concluído (reentrega); ignorando", job.Id);
             return;
         }
 
@@ -69,48 +102,125 @@ public class Worker(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
+        // Download para arquivo temporário: o leitor precisa de Seek (xlsx é um ZIP
+        // com o diretório central no FIM) e o peso do arquivo fica em disco, não na RAM.
+        var tempPath = Path.GetTempFileName();
         try
         {
-            // Fase 1: download e parse ingênuos DE PROPÓSITO — o arquivo inteiro vai
-            // para a memória, reproduzindo o bug que motivou este projeto.
-            // A Fase 2 substitui por leitura em streaming e mede a diferença.
-            using var response = await s3.GetObjectAsync(message.Bucket, message.ObjectKey, ct);
-            using var buffer = new MemoryStream();
-            await response.ResponseStream.CopyToAsync(buffer, ct);
-            buffer.Position = 0;
-
-            var rows = parser.Parse(buffer);
-
-            // Reprocessar do zero é idempotente: a transação apaga o que uma tentativa
-            // interrompida tenha deixado e regrava tudo, ou nada acontece.
-            await using var tx = await db.Database.BeginTransactionAsync(ct);
-            await db.ImportedTransactions.Where(t => t.JobId == job.Id).ExecuteDeleteAsync(ct);
-            db.ImportedTransactions.AddRange(rows.Select(r => new ImportedTransaction
+            using (var response = await s3.GetObjectAsync(message.Bucket, message.ObjectKey, ct))
+            await using (var temp = File.Create(tempPath))
             {
-                JobId = job.Id,
-                RowNumber = r.RowNumber,
-                Date = r.Date,
-                Account = r.Account,
-                Description = r.Description,
-                Amount = r.Amount,
-            }));
-            job.Status = ImportJobStatus.Completed;
-            job.TotalRows = rows.Count;
-            job.ErrorMessage = null;
-            job.UpdatedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(ct);
-            await tx.CommitAsync(ct);
+                await response.ResponseStream.CopyToAsync(temp, ct);
+            }
 
-            logger.LogInformation("Job {JobId} concluído: {Rows} linhas importadas", job.Id, rows.Count);
+            var total = 0;
+            await using (var fileStream = File.OpenRead(tempPath))
+            await using (var tx = await db.Database.BeginTransactionAsync(ct))
+            {
+                await db.ImportedTransactions.Where(t => t.JobId == job.Id).ExecuteDeleteAsync(ct);
+
+                // Inserts em lote com ChangeTracker.Clear(): a memória do EF fica
+                // limitada ao lote corrente, não ao arquivo inteiro.
+                var batch = new List<ImportedTransaction>(BatchSize);
+                foreach (var row in parser.Parse(fileStream))
+                {
+                    batch.Add(new ImportedTransaction
+                    {
+                        JobId = job.Id,
+                        RowNumber = row.RowNumber,
+                        Date = row.Date,
+                        Account = row.Account,
+                        Description = row.Description,
+                        Amount = row.Amount,
+                    });
+
+                    if (batch.Count == BatchSize)
+                    {
+                        total += await FlushAsync(db, batch, ct);
+                    }
+                }
+
+                total += await FlushAsync(db, batch, ct);
+
+                // ChangeTracker.Clear() desanexou o job — ExecuteUpdate escreve direto.
+                await db.ImportJobs.Where(j => j.Id == job.Id).ExecuteUpdateAsync(set => set
+                    .SetProperty(j => j.Status, ImportJobStatus.Completed)
+                    .SetProperty(j => j.TotalRows, total)
+                    .SetProperty(j => j.ErrorMessage, (string?)null)
+                    .SetProperty(j => j.UpdatedAt, DateTimeOffset.UtcNow), ct);
+
+                await tx.CommitAsync(ct);
+            }
+
+            logger.LogInformation("Job {JobId} concluído: {Rows} linhas importadas", job.Id, total);
         }
-        catch (Exception ex)
+        finally
         {
-            // Sem DLQ ainda (Fase 2): a falha vira estado no ledger e a mensagem é ackada.
-            job.Status = ImportJobStatus.Failed;
-            job.ErrorMessage = ex.Message;
-            job.UpdatedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(CancellationToken.None);
-            logger.LogError(ex, "Job {JobId} falhou", job.Id);
+            File.Delete(tempPath);
         }
+    }
+
+    private static async Task<int> FlushAsync(ImportDbContext db, List<ImportedTransaction> batch, CancellationToken ct)
+    {
+        if (batch.Count == 0)
+        {
+            return 0;
+        }
+
+        db.ImportedTransactions.AddRange(batch);
+        await db.SaveChangesAsync(ct);
+        db.ChangeTracker.Clear();
+
+        var flushed = batch.Count;
+        batch.Clear();
+        return flushed;
+    }
+
+    private async Task RecordFailureAsync(FileImportRequested? message, Exception ex, bool exhausted,
+        long attempt, CancellationToken ct)
+    {
+        if (message is null)
+        {
+            return; // mensagem indeserializável: não há job para atualizar
+        }
+
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ImportDbContext>();
+            var status = exhausted ? ImportJobStatus.Failed : ImportJobStatus.Retrying;
+            await db.ImportJobs.Where(j => j.Id == message.JobId).ExecuteUpdateAsync(set => set
+                .SetProperty(j => j.Status, status)
+                .SetProperty(j => j.ErrorMessage, $"Tentativa {attempt}: {ex.Message}")
+                .SetProperty(j => j.UpdatedAt, DateTimeOffset.UtcNow), ct);
+        }
+        catch (Exception dbEx)
+        {
+            logger.LogError(dbEx, "Não foi possível registrar a falha do job {JobId}", message.JobId);
+        }
+    }
+
+    private static long GetRejectionCount(IReadOnlyBasicProperties properties)
+    {
+        if (properties.Headers is null
+            || !properties.Headers.TryGetValue("x-death", out var raw)
+            || raw is not IList<object> deaths)
+        {
+            return 0;
+        }
+
+        foreach (var entry in deaths)
+        {
+            if (entry is IDictionary<string, object> death
+                && death.TryGetValue("queue", out var queue)
+                && queue is byte[] queueBytes
+                && Encoding.UTF8.GetString(queueBytes) == ImportsTopology.FileImportsQueue
+                && death.TryGetValue("count", out var count))
+            {
+                return Convert.ToInt64(count);
+            }
+        }
+
+        return 0;
     }
 }
