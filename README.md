@@ -86,6 +86,21 @@ Demo medida do autoscaling (3 uploads de ~300k linhas com a fila vazia e **zero 
 
 Dev-grade declarado: infra stateful em Deployment simples com credenciais em env var. Em produção: RabbitMQ Cluster Operator, CloudNativePG (ou banco gerenciado), Secrets externos, e o Grafana/LGTM — que aqui ficou fora do cluster de propósito, no papel de observabilidade gerenciada.
 
+### Status de job no DynamoDB (LocalStack)
+
+Status de polling é key-value efêmero: leitura por chave em alta frequência, escrita pequena a cada transição, ninguém liga depois de uns dias. Modelagem (tabela `import-job-status`):
+
+```
+pk = jobId | sk = "LATEST"            → sobrescrito a cada transição (GetItem)
+pk = jobId | sk = "EVENT#<timestamp>" → histórico ordenado pela própria chave (Query)
+```
+
+- `GET /imports/{id}` lê o DynamoDB (`source: status-store`); item expirado ou ausente → **fallback pro ledger Postgres** (`source: ledger`), que nunca esquece.
+- `GET /imports/{id}/timeline` devolve as transições (`Received → Processing → Completed`, com tentativa e erro nas falhas).
+- **Dual-write aceito e documentado**: status é derivado e efêmero — se a escrita no Dynamo falhar, o pior caso é a view atrasar; o ledger corrige na leitura.
+- **TTL é limpeza, não contrato**: no DynamoDB real a remoção acontece em até ~48h após expirar. A leitura filtra `expiresAt` client-side — demonstrado com TTL de 8s: em T+12s a API já respondia pelo ledger com o item ainda fisicamente presente.
+- LocalStack fixado em `localstack/localstack:4` — a última linha community (Apache 2.0); a `latest` de 2026 exige licença.
+
 ## Stack
 
 | Peça | Papel | Por quê |
@@ -107,7 +122,7 @@ Dev-grade declarado: infra stateful em Deployment simples com credenciais em env
 - [x] **2 — Endurecimento**: streaming-parse (medido: 1.148 → 203 MB), retry com TTL + DLQ, roteamento por tipo via exchange, outbox transacional com publisher confirms
 - [x] **3 — Observabilidade**: OTel com trace atravessando outbox e broker (17 spans num upload), métricas de fila/negócio/runtime e logs no Grafana LGTM
 - [x] **4 — Docker multi-stage, Kubernetes, KEDA**: imagens chiseled no GHCR, manifests completos (infra + app), worker escalando 0→N→0 por profundidade de fila
-- [ ] **5 — DynamoDB via LocalStack** (status de job com TTL)
+- [x] **5 — DynamoDB via LocalStack**: status de job como item collection (LATEST + eventos) com TTL e fallback pro ledger
 - [ ] **6 — Polimento**: README completo com justificativas, CI no GitHub Actions
 
 ## Infraestrutura local

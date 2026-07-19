@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Amazon.DynamoDBv2;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -37,6 +38,21 @@ builder.Services.AddSingleton<IConnection>(_ =>
         UserName = builder.Configuration["RabbitMq:User"] ?? "guest",
         Password = builder.Configuration["RabbitMq:Password"] ?? "guest",
     }.CreateConnectionAsync().GetAwaiter().GetResult());
+
+builder.Services.AddSingleton<IAmazonDynamoDB>(_ => new AmazonDynamoDBClient(
+    new BasicAWSCredentials(builder.Configuration["DynamoDb:AccessKey"] ?? "test",
+        builder.Configuration["DynamoDb:SecretKey"] ?? "test"),
+    new AmazonDynamoDBConfig
+    {
+        ServiceURL = builder.Configuration["DynamoDb:ServiceUrl"],
+        // Com ServiceURL customizada o SDK ainda precisa de uma região pra assinar.
+        AuthenticationRegion = "us-east-1",
+    }));
+
+builder.Services.AddSingleton(sp => new JobStatusStore(
+    sp.GetRequiredService<IAmazonDynamoDB>(),
+    builder.Configuration["DynamoDb:TableName"] ?? "import-job-status",
+    builder.Configuration.GetValue("DynamoDb:TtlSeconds", 604800)));
 
 builder.Services.AddHostedService<OutboxDispatcher>();
 
@@ -87,9 +103,11 @@ using (var scope = app.Services.CreateScope())
     var mq = scope.ServiceProvider.GetRequiredService<IConnection>();
     await using var channel = await mq.CreateChannelAsync();
     await ImportsTopology.DeclareAsync(channel, app.Configuration.GetValue("RabbitMq:RetryDelayMs", 10000));
+
+    await scope.ServiceProvider.GetRequiredService<JobStatusStore>().EnsureTableAsync();
 }
 
-app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3, CancellationToken ct) =>
+app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3, JobStatusStore status, CancellationToken ct) =>
 {
     // O upload passa por um arquivo temporário em disco — nunca inteiro pela memória.
     var tempPath = Path.GetTempFileName();
@@ -164,6 +182,17 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
         });
         await db.SaveChangesAsync(ct);
 
+        // Dual-write aceito: status é derivado e efêmero — se esta escrita falhar,
+        // o pior caso é a view ficar atrás do ledger, nunca o contrário.
+        try
+        {
+            await status.WriteTransitionAsync(job.Id, job.Status.ToString(), ct: ct);
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogWarning(ex, "Falha ao gravar status inicial do job {JobId} no DynamoDB", job.Id);
+        }
+
         return Results.Accepted($"/imports/{job.Id}", new { jobId = job.Id, status = job.Status.ToString(), duplicate = false });
     }
     finally
@@ -173,17 +202,50 @@ app.MapPost("/imports", async (IFormFile file, ImportDbContext db, IAmazonS3 s3,
 })
 .DisableAntiforgery();
 
-app.MapGet("/imports/{id:guid}", async (Guid id, ImportDbContext db, CancellationToken ct) =>
-    await db.ImportJobs.FindAsync([id], ct) is { } job
+app.MapGet("/imports/{id:guid}", async (Guid id, ImportDbContext db, JobStatusStore status, CancellationToken ct) =>
+{
+    // Caminho quente: status no DynamoDB. Expirou (TTL)? O ledger nunca esquece.
+    var entry = await status.GetLatestAsync(id, ct);
+    if (entry is not null)
+    {
+        return Results.Ok(new
+        {
+            jobId = id,
+            status = entry.Status,
+            totalRows = entry.TotalRows,
+            error = entry.Error,
+            updatedAt = entry.UpdatedAt,
+            source = "status-store",
+        });
+    }
+
+    return await db.ImportJobs.FindAsync([id], ct) is { } job
         ? Results.Ok(new
         {
             jobId = job.Id,
-            fileName = job.FileName,
             status = job.Status.ToString(),
             totalRows = job.TotalRows,
             error = job.ErrorMessage,
+            updatedAt = job.UpdatedAt,
+            source = "ledger",
         })
-        : Results.NotFound());
+        : Results.NotFound();
+});
+
+app.MapGet("/imports/{id:guid}/timeline", async (Guid id, JobStatusStore status, CancellationToken ct) =>
+{
+    var events = await status.GetTimelineAsync(id, ct);
+    return events.Count > 0
+        ? Results.Ok(events.Select(e => new
+        {
+            status = e.Status,
+            at = e.UpdatedAt,
+            totalRows = e.TotalRows,
+            error = e.Error,
+            attempt = e.Attempt,
+        }))
+        : Results.NotFound();
+});
 
 app.MapGet("/imports", async (ImportDbContext db, CancellationToken ct, int limit = 20) =>
 {

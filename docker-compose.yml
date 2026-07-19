@@ -47,6 +47,19 @@ services:
     volumes:
       - minio-data:/data
 
+  localstack:
+    # v4 = última linha community (Apache 2.0); a "latest" de 2026 exige licença
+    image: localstack/localstack:4
+    ports:
+      - "4566:4566" # edge port (DynamoDB e demais serviços)
+    environment:
+      SERVICES: dynamodb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   otel-lgtm:
     image: grafana/otel-lgtm:latest
     ports:

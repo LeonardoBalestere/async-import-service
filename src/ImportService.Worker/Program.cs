@@ -1,3 +1,4 @@
+using Amazon.DynamoDBv2;
 using Amazon.Runtime;
 using Amazon.S3;
 using ImportService.Data;
@@ -31,6 +32,20 @@ builder.Services.AddSingleton<IConnection>(_ =>
         UserName = builder.Configuration["RabbitMq:User"] ?? "guest",
         Password = builder.Configuration["RabbitMq:Password"] ?? "guest",
     }.CreateConnectionAsync().GetAwaiter().GetResult());
+
+builder.Services.AddSingleton<IAmazonDynamoDB>(_ => new AmazonDynamoDBClient(
+    new BasicAWSCredentials(builder.Configuration["DynamoDb:AccessKey"] ?? "test",
+        builder.Configuration["DynamoDb:SecretKey"] ?? "test"),
+    new AmazonDynamoDBConfig
+    {
+        ServiceURL = builder.Configuration["DynamoDb:ServiceUrl"],
+        AuthenticationRegion = "us-east-1",
+    }));
+
+builder.Services.AddSingleton(sp => new JobStatusStore(
+    sp.GetRequiredService<IAmazonDynamoDB>(),
+    builder.Configuration["DynamoDb:TableName"] ?? "import-job-status",
+    builder.Configuration.GetValue("DynamoDb:TtlSeconds", 604800)));
 
 builder.Services.AddSingleton<ITransactionParser, StreamingExcelTransactionParser>();
 builder.Services.AddHostedService<Worker>();

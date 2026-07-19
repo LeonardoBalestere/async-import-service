@@ -15,6 +15,7 @@ public class Worker(
     IConnection connection,
     IAmazonS3 s3,
     ITransactionParser parser,
+    JobStatusStore statusStore,
     IServiceScopeFactory scopeFactory,
     IConfiguration configuration,
     ILogger<Worker> logger) : BackgroundService
@@ -112,6 +113,7 @@ public class Worker(
             job.Status = ImportJobStatus.Processing;
             job.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(ct);
+            await TryWriteStatusAsync(job.Id, "Processing", ct: ct);
 
             // Download para arquivo temporário: o leitor precisa de Seek (xlsx é um ZIP
             // com o diretório central no FIM) e o peso do arquivo fica em disco, não na RAM.
@@ -166,6 +168,7 @@ public class Worker(
                 activity?.SetTag("import.total_rows", total);
                 ImportTelemetry.RowsImported.Add(total);
                 ImportTelemetry.ImportDuration.Record(stopwatch.Elapsed.TotalSeconds);
+                await TryWriteStatusAsync(job.Id, "Completed", totalRows: total, ct: ct);
 
                 logger.LogInformation("Job {JobId} concluído: {Rows} linhas importadas", job.Id, total);
             }
@@ -214,10 +217,26 @@ public class Worker(
                 .SetProperty(j => j.Status, status)
                 .SetProperty(j => j.ErrorMessage, $"Tentativa {attempt}: {ex.Message}")
                 .SetProperty(j => j.UpdatedAt, DateTimeOffset.UtcNow), ct);
+
+            await TryWriteStatusAsync(message.JobId, status.ToString(), error: ex.Message, attempt: attempt, ct: ct);
         }
         catch (Exception dbEx)
         {
             logger.LogError(dbEx, "Não foi possível registrar a falha do job {JobId}", message.JobId);
+        }
+    }
+
+    private async Task TryWriteStatusAsync(Guid jobId, string status, int? totalRows = null,
+        string? error = null, long? attempt = null, CancellationToken ct = default)
+    {
+        // Caminho não-crítico: a view de status jamais pode derrubar o processamento.
+        try
+        {
+            await statusStore.WriteTransitionAsync(jobId, status, totalRows, error, attempt, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Falha ao gravar status {Status} do job {JobId} no DynamoDB", status, jobId);
         }
     }
 
