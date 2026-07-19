@@ -15,6 +15,8 @@ RUN dotnet publish src/ImportService.Gateway/ImportService.Gateway.csproj -c Rel
 
 # Estágio 2: runtime chiseled — sem shell, sem package manager, non-root.
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled
+# Vincula o pacote no GHCR a este repositório (acesso do CI e página do pacote).
+LABEL org.opencontainers.image.source=https://github.com/LeonardoBalestere/async-import-service
 WORKDIR /app
 COPY --from=build /app .
 # A imagem base já expõe 8080 e roda como usuário não-privilegiado (app).
