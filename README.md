@@ -32,7 +32,7 @@ O arquivo vai para o object storage; a mensagem carrega **só a referência** (p
 ## Fases
 
 - [x] **0 — Fundação**: solution, docker-compose (RabbitMQ + Postgres + MinIO), contrato da mensagem
-- [ ] **1 — MVP ponta a ponta**: upload → storage → publish → consume → parse → Postgres, com idempotência, ack manual e entidade de job mínima
+- [x] **1 — MVP ponta a ponta**: upload → storage → publish → consume → parse → Postgres, com idempotência, ack manual e entidade de job mínima
 - [ ] **2 — Endurecimento**: streaming-parse (com medição de memória antes/depois), DLQ com retry, roteamento por tipo, endpoint de status, publisher confirms
 - [ ] **3 — Observabilidade**: OTel com propagação de contexto através do broker, métricas de fila/lag/memória
 - [ ] **4 — Docker multi-stage, Kubernetes, KEDA**

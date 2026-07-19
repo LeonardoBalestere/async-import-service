@@ -1,7 +1,11 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/ImportService.Contracts/ImportService.Contracts.csproj" />
+    <Project Path="src/ImportService.Data/ImportService.Data.csproj" />
     <Project Path="src/ImportService.Gateway/ImportService.Gateway.csproj" />
     <Project Path="src/ImportService.Worker/ImportService.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ImportService.Tests/ImportService.Tests.csproj" />
   </Folder>
 </Solution>
