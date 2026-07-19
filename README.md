@@ -1,5 +1,7 @@
 # async-import-service
 
+[![CI](https://github.com/LeonardoBalestere/async-import-service/actions/workflows/ci.yml/badge.svg)](https://github.com/LeonardoBalestere/async-import-service/actions/workflows/ci.yml)
+
 Importação assíncrona de arquivos de grande volume. Inspirado num sistema real em que o processamento **síncrono** carregava o Excel inteiro em memória durante o request e derrubava o servidor web. Esta versão conserta o problema com mensageria, object storage e streaming.
 
 ## Arquitetura
@@ -113,7 +115,7 @@ pk = jobId | sk = "EVENT#<timestamp>" → histórico ordenado pela própria chav
 | Grafana LGTM (Tempo/Mimir/Loki) | backend de observabilidade | mesmo stack de produção, recebendo OTLP |
 | Docker / K8s + KEDA | execução e autoscaling por profundidade de fila | fase 4 |
 | DynamoDB (LocalStack) | status de job com TTL | fase 5 |
-| xUnit + Testcontainers | testes unitários e de integração | desde a fase 1 |
+| xUnit + Testcontainers | testes unitários e de integração | integração roda contra Postgres e LocalStack REAIS |
 
 ## Fases
 
@@ -123,7 +125,7 @@ pk = jobId | sk = "EVENT#<timestamp>" → histórico ordenado pela própria chav
 - [x] **3 — Observabilidade**: OTel com trace atravessando outbox e broker (17 spans num upload), métricas de fila/negócio/runtime e logs no Grafana LGTM
 - [x] **4 — Docker multi-stage, Kubernetes, KEDA**: imagens chiseled no GHCR, manifests completos (infra + app), worker escalando 0→N→0 por profundidade de fila
 - [x] **5 — DynamoDB via LocalStack**: status de job como item collection (LATEST + eventos) com TTL e fallback pro ledger
-- [ ] **6 — Polimento**: README completo com justificativas, CI no GitHub Actions
+- [x] **6 — Polimento**: testes de integração com Testcontainers, CI no GitHub Actions publicando as imagens no GHCR, README final
 
 ## Infraestrutura local
 
@@ -138,3 +140,40 @@ docker compose up -d
 | PostgreSQL | `localhost:5432` | import / import — db `importdb` |
 | MinIO (S3 API) | http://localhost:9000 | minioadmin / minioadmin |
 | MinIO (console) | http://localhost:9001 | minioadmin / minioadmin |
+| LocalStack (DynamoDB) | http://localhost:4566 | test / test |
+| Grafana | http://localhost:3000 | anônimo |
+
+### Rodando os serviços e os testes
+
+```bash
+dotnet run --project src/ImportService.Gateway   # API em http://localhost:5080 (--urls)
+dotnet run --project src/ImportService.Worker
+
+dotnet test   # unitários + integração (Testcontainers: precisa de Docker rodando)
+```
+
+O CI (GitHub Actions) compila, roda todos os testes e — em `main` — publica as
+imagens no GHCR usando o `GITHUB_TOKEN` nativo (que já nasce com `packages: write`).
+
+## Decisões e trade-offs
+
+| Decisão | Escolha | Por quê | Quando a alternativa venceria |
+|---|---|---|---|
+| Broker | RabbitMQ (work queue) | o problema é distribuição de trabalho com ack por item | Kafka, se precisasse de replay/event log |
+| Payload da mensagem | Claim Check (referência) | mensagem de ~300 bytes; broker não é storage | payload embutido, só pra eventos minúsculos |
+| Publicação | Outbox transacional + confirms | elimina o dual-write causativo; upload funciona com broker morto | publish direto, se perder mensagem fosse tolerável |
+| Retry | Fila TTL + DLX, x-death, parking-lot | broker carrega o estado; worker stateless | Polly in-process, se a espera fosse de milissegundos |
+| Parse | ExcelDataReader streaming + lotes | 1.148 MB → 203 MB medidos no mesmo arquivo | ClosedXML, se precisasse de acesso aleatório a células |
+| Persistência bulk | EF em lotes + ChangeTracker.Clear | suficiente e legível; 300k linhas em ~40s | COPY binário do Npgsql, para milhões de linhas |
+| Status de job | DynamoDB com TTL + fallback ledger | key-value efêmero de alta frequência; expira sozinho | só Postgres, em volume baixo; Redis, se TTL real importasse |
+| Imagens | Multi-stage → chiseled non-root | 171-195 MB, sem shell, superfície mínima | imagem cheia, se debugar com exec fosse rotina |
+| Autoscaling | KEDA por profundidade de fila | o sinal certo pra worker de fila é backlog, não CPU | HPA por CPU, para serviços request/response |
+
+## Evoluções conhecidas (dívidas declaradas)
+
+- **Shutdown gracioso do worker**: hoje o scale-in reenfileira a mensagem em voo (seguro por idempotência); o refinamento é drenar antes de morrer.
+- **Purga da outbox**: linhas despachadas acumulam — um job periódico de limpeza (ou TTL por partição) resolve.
+- **Backoff exponencial**: a fila de retry tem espera fixa; degraus exigiriam uma fila por atraso ou o plugin de delayed exchange.
+- **GSI por status no DynamoDB**: "todos os jobs Failed" não existe sem índice secundário.
+- **Infra stateful com operators** (RabbitMQ Cluster Operator, CloudNativePG) e Secrets de verdade nos manifests.
+- **SignalR** para push de status em tempo real, no lugar do polling.

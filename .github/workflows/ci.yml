@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build ImportService.slnx -c Release
+
+      # Os testes de integração usam Testcontainers (Postgres + LocalStack);
+      # o runner ubuntu-latest já tem Docker disponível.
+      - name: Test
+        run: dotnet test ImportService.slnx -c Release --no-build
+
+  publish-images:
+    # Publica só em main: PRs provam o build, main produz artefato.
+    if: github.ref == 'refs/heads/main'
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # o GITHUB_TOKEN nasce com este escopo aqui — sem PAT
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR exige caminho minúsculo; o owner do repo é "LeonardoBalestere".
+      - name: Lowercase owner
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - name: Build and push gateway
+        run: |
+          docker build \
+            -t "ghcr.io/$OWNER_LC/import-gateway:${{ github.sha }}" \
+            -t "ghcr.io/$OWNER_LC/import-gateway:latest" \
+            -f src/ImportService.Gateway/Dockerfile .
+          docker push --all-tags "ghcr.io/$OWNER_LC/import-gateway"
+
+      - name: Build and push worker
+        run: |
+          docker build \
+            -t "ghcr.io/$OWNER_LC/import-worker:${{ github.sha }}" \
+            -t "ghcr.io/$OWNER_LC/import-worker:latest" \
+            -f src/ImportService.Worker/Dockerfile .
+          docker push --all-tags "ghcr.io/$OWNER_LC/import-worker"
